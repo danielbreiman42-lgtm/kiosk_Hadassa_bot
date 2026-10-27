@@ -2,9 +2,10 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -14,7 +15,8 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+                           BufferedInputFile)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -192,6 +194,7 @@ class Form(StatesGroup):
     reply_to = State()
     reply_text = State()
     edit_sell = State()
+    report_range = State()
 
 
 class Abort(Exception):
@@ -645,10 +648,187 @@ async def stock_view(call: CallbackQuery):
         "SELECT name_ru,name_he,stock,sell_price_agorot FROM products WHERE is_active=1 ORDER BY category,name_ru")
     name_key = "name_ru" if lang == "ru" else "name_he"
     unit = "шт." if lang == "ru" else "יח׳"
-    text = "\n".join(f'{p[name_key]}: {p["stock"]} {unit} — {money(p["sell_price_agorot"])}'
-                     for p in rows) or t(lang, "no_products")
-    await call.message.edit_text(text, reply_markup=back_kb(lang))
+    if rows:
+        total_value = sum(int(p["stock"]) * int(p["sell_price_agorot"]) for p in rows)
+        header = ("💰 Товара на продажу на сумму: " if lang == "ru" else "💰 מוצרים למכירה בסכום של: ") + money(total_value)
+        lines = [f'{p[name_key]}: {p["stock"]} {unit} — {money(p["sell_price_agorot"])}' for p in rows]
+        text = header + "\n\n" + "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:3990] + "\n…"
+    else:
+        text = t(lang, "no_products")
+    await call.message.edit_text(text, reply_markup=kb([
+        [("📄 Скачать PDF" if lang == "ru" else "📄 הורד PDF", "stock:pdf")],
+        [(t(lang, "back"), "menu:main")]]))
     await call.answer()
+
+
+# ---------------------------------------------------------------- PDF остатков
+
+_PDF_FONTS = None
+
+
+def _register_pdf_fonts():
+    """Ищет шрифт с кириллицей и ивритом (Arial на Windows) и регистрирует его в reportlab."""
+    global _PDF_FONTS
+    if _PDF_FONTS:
+        return _PDF_FONTS
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    win = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+    candidates = [
+        (BASE_DIR / "font.ttf", BASE_DIR / "font-bold.ttf"),  # свой шрифт рядом со скриптом
+        (win / "arial.ttf", win / "arialbd.ttf"),
+        (Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")),
+        (Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
+         Path("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf")),
+        (Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+         Path("/System/Library/Fonts/Supplemental/Arial Bold.ttf")),
+    ]
+    for regular, bold in candidates:
+        if regular.exists():
+            pdfmetrics.registerFont(TTFont("BotFont", str(regular)))
+            pdfmetrics.registerFont(TTFont("BotFont-Bold", str(bold if bold.exists() else regular)))
+            _PDF_FONTS = ("BotFont", "BotFont-Bold")
+            return _PDF_FONTS
+    raise RuntimeError("Не найден шрифт с кириллицей и ивритом. Положите arial.ttf как font.ttf рядом со скриптом.")
+
+
+def _visual_rtl(text):
+    """Иврит пишется справа налево, а reportlab рисует слева направо: переупорядочиваем символы."""
+    try:
+        from bidi.algorithm import get_display
+        return get_display(text)
+    except ImportError:
+        # запасной вариант без python-bidi: меняем порядок символов, но числа и латиницу оставляем целыми
+        import re
+        tokens = re.findall(r"[0-9A-Za-z][0-9A-Za-z.,:%/\-]*|.", text, re.S)
+        return "".join(reversed(tokens))
+
+
+def build_stock_pdf(rows, lang, show_buy=False):
+    """PDF: наименование, количество, цена продажи (и цена закупки для администраторов). Возвращает bytes."""
+    import io
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT, TA_RIGHT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    font, font_bold = _register_pdf_fonts()
+    ru = lang == "ru"
+    fix = (lambda x: x) if ru else _visual_rtl
+    name_key = "name_ru" if ru else "name_he"
+    align = TA_LEFT if ru else TA_RIGHT
+    size = 10
+
+    title = "Остатки товара" if ru else "מלאי מוצרים"
+    headers = ["№", "Наименование", "Кол-во", "Цена продажи"] if ru else ["#", "שם מוצר", "כמות", "מחיר מכירה"]
+    if show_buy:
+        headers.append("Цена закупки" if ru else "מחיר קנייה")
+    total_label = "Итого" if ru else "סה״כ"
+
+    widths = [12 * mm, 66 * mm, 22 * mm, 40 * mm, 40 * mm] if show_buy else [12 * mm, 90 * mm, 28 * mm, 50 * mm]
+
+    def fit(text, width):
+        """Обрезает слишком длинное название, чтобы оно не вылезало за ячейку."""
+        limit = width - 8
+        if stringWidth(text, font, size) <= limit:
+            return text
+        while text and stringWidth(text + "…", font, size) > limit:
+            text = text[:-1]
+        return text + "…"
+
+    data = [[fix(h) for h in headers]]
+    total_qty = sell_value = buy_value = 0
+    for i, p in enumerate(rows, 1):
+        qty = int(p["stock"])
+        sell, buy = int(p["sell_price_agorot"]), int(p["buy_price_agorot"])
+        total_qty += qty
+        sell_value += qty * sell
+        buy_value += qty * buy
+        line = [str(i), fix(fit(str(p[name_key]), widths[1])), str(qty), money(sell)]
+        if show_buy:
+            line.append(money(buy))
+        data.append(line)
+    data.append(["", fix(total_label), str(total_qty)] + [""] * (len(headers) - 3))
+
+    name_col = 1
+    if not ru:  # для иврита колонки идут справа налево
+        data = [list(reversed(r)) for r in data]
+        widths = list(reversed(widths))
+        name_col = len(headers) - 2
+    last = len(data) - 1
+
+    table = Table(data, colWidths=widths, repeatRows=1)
+    table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), font),
+        ("FONTNAME", (0, 0), (-1, 0), font_bold),
+        ("FONTNAME", (0, last), (-1, last), font_bold),
+        ("FONTSIZE", (0, 0), (-1, -1), size),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2f4858")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("ROWBACKGROUNDS", (0, 1), (-1, last - 1), [colors.white, colors.HexColor("#eef2f5")]),
+        ("BACKGROUND", (0, last), (-1, last), colors.HexColor("#d9e2e8")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#b8c4cc")),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("ALIGN", (name_col, 0), (name_col, -1), "LEFT" if ru else "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+
+    title_style = ParagraphStyle("t", fontName=font_bold, fontSize=18, leading=22, alignment=align)
+    date_style = ParagraphStyle("d", fontName=font, fontSize=10, leading=14, alignment=align,
+                                textColor=colors.HexColor("#555555"))
+    sum_style = ParagraphStyle("s", fontName=font_bold, fontSize=11, leading=16, alignment=align)
+
+    summary = [fix(("Стоимость остатков по цене продажи: " if ru else "שווי המלאי במחיר מכירה: ") + money(sell_value))]
+    if show_buy:
+        summary.append(fix(("Стоимость остатков по цене закупки: " if ru else "שווי המלאי במחיר קנייה: ") + money(buy_value)))
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm,
+                            topMargin=15 * mm, bottomMargin=15 * mm, title=title)
+    doc.build([
+        Paragraph(fix(title), title_style),
+        Paragraph(datetime.now().strftime("%d.%m.%Y %H:%M"), date_style),
+        Spacer(1, 8 * mm),
+        table,
+        Spacer(1, 6 * mm),
+    ] + [Paragraph(line, sum_style) for line in summary])
+    return buf.getvalue()
+
+
+@dp.callback_query(F.data == "stock:pdf")
+async def stock_pdf(call: CallbackQuery):
+    u = await get_user(call.from_user.id)
+    lang = lang_for(u)
+    if not u or u["is_blocked"]:
+        await call.answer(t(lang, "blocked"), show_alert=True)
+        return
+    rows = await fetchall(
+        "SELECT name_ru,name_he,stock,sell_price_agorot,buy_price_agorot FROM products "
+        "WHERE is_active=1 ORDER BY category,name_ru")
+    if not rows:
+        await call.answer(t(lang, "no_products"), show_alert=True)
+        return
+    await call.answer("⏳")
+    try:
+        # цену закупки видят только администраторы
+        data = await asyncio.to_thread(build_stock_pdf, rows, lang, has_role(u, ADMINS))
+    except Exception:
+        logging.exception("PDF generation failed")
+        await call.message.answer(
+            "Не удалось создать PDF. Проверьте: pip install reportlab python-bidi" if lang == "ru"
+            else "יצירת ה-PDF נכשלה. בדוק: pip install reportlab python-bidi")
+        return
+    await call.message.answer_document(
+        BufferedInputFile(data, filename=f"stock_{datetime.now():%Y-%m-%d}.pdf"),
+        caption="📄 Остатки товара" if lang == "ru" else "📄 מלאי מוצרים")
 
 
 @dp.callback_query(F.data == "sales:mine")
@@ -1142,6 +1322,7 @@ async def reports_menu(call: CallbackQuery):
         return
     await call.message.edit_text("Выберите отчёт / בחר דוח", reply_markup=kb([
         [("📅 Сегодня / היום", "reports:today"), ("📆 Месяц / החודש", "reports:month")],
+        [("💹 Финансы за период / כספים לתקופה", "reports:period")],
         [("🏆 Рейтинг / דירוג", "reports:rank")],
         [(t(u["language"], "back"), "menu:main")]
     ]))
@@ -1181,6 +1362,160 @@ async def report_rank(call: CallbackQuery):
         text = t(lang, "no_sales")
     await call.message.edit_text(text, reply_markup=back_kb(lang, "reports:menu"))
     await call.answer()
+
+
+# ---------------------------------------------------------------- финансы за период
+
+PERIODS = [("today", "Сегодня", "היום"), ("yesterday", "Вчера", "אתמול"),
+           ("week", "7 дней", "7 ימים"), ("month", "Этот месяц", "החודש"),
+           ("prevmonth", "Прошлый месяц", "חודש שעבר"), ("all", "За всё время", "כל הזמן")]
+
+
+def period_bounds(key):
+    """(начало, конец-не-включая) для готового периода; None означает «без границы»."""
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    day = timedelta(days=1)
+    first = today.replace(day=1)
+    next_first = (first + timedelta(days=32)).replace(day=1)
+    prev_first = (first - day).replace(day=1)
+    return {
+        "today": (today, today + day),
+        "yesterday": (today - day, today),
+        "week": (today - 6 * day, today + day),
+        "month": (first, next_first),
+        "prevmonth": (prev_first, first),
+        "all": (None, None),
+    }[key]
+
+
+def parse_period(text):
+    """Одна дата = один день, две даты = период (включительно). Форматы: 01.10.2026 или 2026-10-01."""
+    found = []
+    for m in re.finditer(r"(\d{1,2})[./](\d{1,2})[./](\d{4})|(\d{4})-(\d{2})-(\d{2})", text or ""):
+        try:
+            if m.group(1):
+                found.append(datetime(int(m.group(3)), int(m.group(2)), int(m.group(1))))
+            else:
+                found.append(datetime(int(m.group(4)), int(m.group(5)), int(m.group(6))))
+        except ValueError:
+            return None
+    if not found or len(found) > 2:
+        return None
+    return min(found), max(found) + timedelta(days=1)
+
+
+def period_label(start, end, lang):
+    if start is None and end is None:
+        return "за всё время" if lang == "ru" else "כל הזמן"
+    first = start.strftime("%d.%m.%Y")
+    last = (end - timedelta(days=1)).strftime("%d.%m.%Y")
+    return first if first == last else f"{first} – {last}"
+
+
+async def finance_summary(start, end):
+    sql = ("SELECT COUNT(*) n,COALESCE(SUM(total_agorot),0) revenue,"
+           "COALESCE(SUM(total_cost_agorot),0) cost FROM sales WHERE status='completed'")
+    args = []
+    if start is not None:
+        sql += " AND confirmed_at >= %s"
+        args.append(start)
+    if end is not None:
+        sql += " AND confirmed_at < %s"
+        args.append(end)
+    return await fetchone(sql, tuple(args))
+
+
+def format_finance(lang, start, end, row):
+    ru = lang == "ru"
+    revenue, cost = int(row["revenue"]), int(row["cost"])
+    profit = revenue - cost
+    margin = f" ({profit / revenue * 100:.1f}%)" if revenue > 0 else ""
+    return "\n".join([
+        ("📊 Период: " if ru else "📊 תקופה: ") + period_label(start, end, lang),
+        ("🧾 Продаж: " if ru else "🧾 מכירות: ") + str(row["n"]),
+        "",
+        ("💰 Выручка: " if ru else "💰 הכנסות: ") + money(revenue),
+        ("📦 Расходы (себестоимость проданного): " if ru else "📦 הוצאות (עלות המוצרים שנמכרו): ") + money(cost),
+        ("📈 Прибыль: " if ru else "📈 רווח: ") + money(profit) + margin,
+    ])
+
+
+def finance_kb(lang):
+    ru = lang == "ru"
+    rows, row = [], []
+    for key, name_ru, name_he in PERIODS:
+        row.append((name_ru if ru else name_he, f"reports:p:{key}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([("🗓 Свой период" if ru else "🗓 תקופה מותאמת", "reports:custom")])
+    rows.append([(t(lang, "back"), "reports:menu")])
+    return kb(rows)
+
+
+@dp.callback_query(F.data == "reports:period")
+async def finance_period_menu(call: CallbackQuery, state: FSMContext):
+    u = await guard(call, ADMINS)
+    if not u:
+        return
+    await state.clear()
+    lang = u["language"]
+    await call.message.edit_text(
+        "Выручка, расходы и прибыль.\nВыберите период:" if lang == "ru"
+        else "הכנסות, הוצאות ורווח.\nבחר תקופה:", reply_markup=finance_kb(lang))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("reports:p:"))
+async def finance_period_result(call: CallbackQuery):
+    u = await guard(call, ADMINS)
+    if not u:
+        return
+    key = call.data.rsplit(":", 1)[1]
+    if key not in dict((k, 1) for k, _, _ in PERIODS):
+        await call.answer()
+        return
+    start, end = period_bounds(key)
+    row = await finance_summary(start, end)
+    await call.message.edit_text(format_finance(u["language"], start, end, row),
+                                 reply_markup=finance_kb(u["language"]))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "reports:custom")
+async def finance_custom_start(call: CallbackQuery, state: FSMContext):
+    u = await guard(call, ADMINS)
+    if not u:
+        return
+    await state.set_state(Form.report_range)
+    await call.message.answer(
+        "Введите период: две даты через дефис, например\n01.10.2026 - 27.10.2026\n"
+        "Одна дата покажет один день. Отмена: /cancel" if u["language"] == "ru"
+        else "הזן תקופה: שני תאריכים עם מקף, למשל\n01.10.2026 - 27.10.2026\n"
+             "תאריך אחד יציג יום אחד. ביטול: /cancel")
+    await call.answer()
+
+
+@dp.message(Form.report_range)
+async def finance_custom_result(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    u = await get_user(uid)
+    lang = lang_for(u)
+    if not has_role(u, ADMINS):
+        await state.clear()
+        await message.answer(t(lang, "not_allowed"))
+        return
+    bounds = parse_period(message.text)
+    if not bounds:
+        await message.answer("Не понял даты. Пример: 01.10.2026 - 27.10.2026" if lang == "ru"
+                             else "לא הבנתי את התאריכים. דוגמה: 01.10.2026 - 27.10.2026")
+        return
+    start, end = bounds
+    row = await finance_summary(start, end)
+    await state.clear()
+    await message.answer(format_finance(lang, start, end, row), reply_markup=finance_kb(lang))
 
 
 # ---------------------------------------------------------------- users (superadmin)
