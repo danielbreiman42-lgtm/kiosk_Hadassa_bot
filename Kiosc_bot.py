@@ -1540,6 +1540,7 @@ async def reports_menu(call: CallbackQuery):
     await call.message.edit_text("Выберите отчёт / בחר דוח", reply_markup=kb([
         [("📊 Финансовый отчёт за период / דוח כספי לתקופה", "reports:period")],
         [("🏆 Рейтинг продавцов / דירוג מוכרים", "reports:rank")],
+        [("📈 Рейтинг выгодных товаров / דירוג רווחיות מוצרים", "reports:products")],
         [(t(u["language"], "back"), "menu:main")]
     ]))
     await call.answer()
@@ -1716,7 +1717,7 @@ def _as_dt(v):
     return v if isinstance(v, datetime) else datetime.combine(v, datetime.min.time())
 
 
-async def top_products(start, end, limit=5):
+async def top_products(start, end, limit=5, only_positive=True):
     """Самые выгодные товары: чем быстрее продаётся товар и чем больше с него прибыль, тем выше.
     Время продажи = от закупки (последняя закупка до первой продажи периода) до последней продажи,
     не меньше 1 суток. Оценка = прибыль ÷ время продажи, то есть прибыль × скорость (1 / дни)."""
@@ -1732,7 +1733,7 @@ async def top_products(start, end, limit=5):
         sql += " AND s.confirmed_at < %s"
         args.append(end)
     items = [x for x in await fetchall(sql + " GROUP BY i.product_id", tuple(args))
-             if x["profit"] is not None and x["profit"] > 0]
+             if x["profit"] is not None and (x["profit"] > 0 or not only_positive)]
     if not items:
         return [], True
     col = await ts_column("stock_operations")
@@ -1781,6 +1782,73 @@ async def finance_report_text(lang, start, end):
     row = await finance_summary(start, end)
     top, has_dates = await top_products(start, end)
     return format_finance(lang, start, end, row) + "\n" + format_top_products(lang, top, has_dates)
+
+
+def chunk_text(lines, limit=3800):
+    """Делит длинный список на части, чтобы уложиться в лимит сообщения Telegram."""
+    chunks, cur, size = [], [], 0
+    for line in lines:
+        if cur and size + len(line) + 1 > limit:
+            chunks.append("\n".join(cur))
+            cur, size = [], 0
+        cur.append(line)
+        size += len(line) + 1
+    if cur:
+        chunks.append("\n".join(cur))
+    return chunks
+
+
+@dp.callback_query(F.data.startswith("reports:products"))
+async def report_products(call: CallbackQuery):
+    u = await guard(call, ADMINS)
+    if not u:
+        return
+    lang = u["language"]
+    ru = lang == "ru"
+    key = "month" if call.data.endswith(":month") else "all"
+    start, end = period_bounds(key)
+    ranked, has_dates = await top_products(start, end, limit=None, only_positive=False)
+    sold_ids = {r["product_id"] for r in ranked}
+    products = await fetchall("SELECT id,name_ru,name_he FROM products WHERE is_active=1 ORDER BY name_ru")
+    unsold = [p for p in products if p["id"] not in sold_ids]
+    name_key = "name_ru" if ru else "name_he"
+
+    lines = [
+        "📈 Рейтинг выгодных товаров" if ru else "📈 דירוג רווחיות מוצרים",
+        ("Период: " if ru else "תקופה: ") + period_label(start, end, lang),
+        "(прибыль ÷ время продажи: чем быстрее продаётся и больше прибыль, тем выше)" if ru
+        else "(רווח ÷ זמן מכירה: ככל שנמכר מהר יותר ורווחי יותר — מקום גבוה יותר)",
+        "",
+    ]
+    if not ranked and not unsold:
+        lines.append(t(lang, "no_products"))
+    for i, r in enumerate(ranked, 1):
+        days = f'{r["days"]:.1f}'.rstrip("0").rstrip(".")
+        if ru:
+            lines.append(f'{i}. {r[name_key]} — {money(round(r["score"]))}/день (прибыль {money(r["profit"])} за {days} дн.)')
+        else:
+            lines.append(f'{i}. {r[name_key]} — {money(round(r["score"]))} ליום (רווח {money(r["profit"])} ב-{days} '
+                         f'{"יום" if days == "1" else "ימים"})')
+    if unsold:
+        lines += ["", "Без продаж за период:" if ru else "ללא מכירות בתקופה:"]
+        lines += [f'— {p[name_key]}' for p in unsold]
+    if ranked and not has_dates:
+        lines += ["", "ℹ️ В таблице закупок нет колонки с датой — время считается от первой продажи." if ru
+                  else "ℹ️ אין עמודת תאריך בטבלת הרכישות — הזמן נספר מהמכירה הראשונה."]
+
+    markup = kb([
+        [("📅 Этот месяц" if ru else "📅 החודש", "reports:products:month"),
+         ("🏅 За всё время" if ru else "🏅 כל הזמן", "reports:products:all")],
+        [(t(lang, "back"), "reports:menu")]])
+    chunks = chunk_text(lines)
+    if len(chunks) == 1:
+        await safe_edit(call, chunks[0], markup)
+    else:
+        await safe_edit(call, chunks[0], None)
+        for part in chunks[1:-1]:
+            await call.message.answer(part)
+        await call.message.answer(chunks[-1], reply_markup=markup)
+    await call.answer()
 
 
 @dp.callback_query(F.data == "reports:period")
