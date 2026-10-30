@@ -2,19 +2,22 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import aiomysql
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+                           BufferedInputFile)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -192,6 +195,8 @@ class Form(StatesGroup):
     reply_to = State()
     reply_text = State()
     edit_sell = State()
+    report_range = State()
+    edit_price = State()
 
 
 class Abort(Exception):
@@ -494,33 +499,140 @@ async def sale_more(call: CallbackQuery, state: FSMContext):
     await show_categories(call, state, reset=False)
 
 
-@dp.callback_query(F.data.startswith("sale:cat:"))
-async def sale_category(call: CallbackQuery):
-    cat = call.data.split(":", 2)[2]
+QUICK_QTY = (1, 2, 3, 5, 10)
+
+
+async def safe_edit(call, text, markup=None):
+    """edit_text, который не падает, если текст и кнопки не изменились."""
+    try:
+        await call.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
+
+
+async def show_products(call, state, cat):
+    """Список товаров категории. Товары из корзины помечены ✅ ×N, можно сразу выбирать следующие."""
     lang = await lang_of(call.from_user.id)
+    cart = (await state.get_data()).get("cart", {})
     products = await fetchall(
         "SELECT id,name_ru,name_he,sell_price_agorot,stock FROM products WHERE is_active=1 AND category=%s ORDER BY name_ru",
         (cat,))
     name_key = "name_ru" if lang == "ru" else "name_he"
     left = "ост." if lang == "ru" else "מלאי"
-    rows = [[(f'{p[name_key]} — {money(p["sell_price_agorot"])} ({left} {p["stock"]})'[:60],
-              f"sale:product:{p['id']}")] for p in products]
+    rows = []
+    for p in products:
+        qty = int(cart.get(str(p["id"]), 0))
+        mark = f"✅ ×{qty} " if qty > 0 else ""
+        rows.append([(f'{mark}{p[name_key]} — {money(p["sell_price_agorot"])} ({left} {p["stock"]})'[:60],
+                      f"sale:product:{p['id']}")])
+    units = sum(int(q) for q in cart.values() if int(q) > 0)
+    if units:
+        rows.append([(f"🛒 Корзина ({units})" if lang == "ru" else f"🛒 עגלה ({units})", "sale:cart")])
     rows.append([(t(lang, "back"), "sale:more")])
-    await call.message.edit_text(t(lang, "choose_product"), reply_markup=kb(rows))
+    await safe_edit(call, t(lang, "choose_product"), kb(rows))
+
+
+@dp.callback_query(F.data.startswith("sale:cat:"))
+async def sale_category(call: CallbackQuery, state: FSMContext):
+    cat = call.data.split(":", 2)[2]
+    await state.update_data(last_cat=cat)
+    await show_products(call, state, cat)
     await call.answer()
+
+
+@dp.callback_query(F.data == "sale:done")
+async def sale_done(call: CallbackQuery, state: FSMContext):
+    cat = (await state.get_data()).get("last_cat")
+    if not cat:
+        await show_categories(call, state, reset=False)
+        return
+    await show_products(call, state, cat)
+    await call.answer()
+
+
+async def show_picker(call, state, p, lang):
+    """Экран товара: количество выбирается сразу (кнопки 1/2/3/5/10 и ➖/➕)."""
+    ru = lang == "ru"
+    cart = (await state.get_data()).get("cart", {})
+    qty = int(cart.get(str(p["id"]), 0))
+    price, stock = int(p["sell_price_agorot"]), int(p["stock"])
+    text = "\n".join([
+        p["name_ru" if ru else "name_he"],
+        f'{"Цена" if ru else "מחיר"}: {money(price)} · {"ост." if ru else "מלאי"}: {stock}',
+        "",
+        f'{"В корзине" if ru else "בעגלה"}: {qty} × {money(price)} = {money(qty * price)}',
+        "",
+        "Выберите количество:" if ru else "בחר כמות:",
+    ])
+    pid = p["id"]
+    rows = [[("➖", f"sale:adj:{pid}:-1"), ("➕", f"sale:adj:{pid}:1")]]
+    quick = [(f"✓{n}" if n == qty else str(n), f"sale:set:{pid}:{n}") for n in QUICK_QTY if n <= stock]
+    if quick:
+        rows.append(quick)
+    rows.append([("⬅️ К товарам" if ru else "⬅️ למוצרים", "sale:done"),
+                 ("🛒 Корзина" if ru else "🛒 עגלה", "sale:cart")])
+    await safe_edit(call, text, kb(rows))
 
 
 @dp.callback_query(F.data.startswith("sale:product:"))
 async def sale_product(call: CallbackQuery, state: FSMContext):
     pid = int(call.data.rsplit(":", 1)[1])
+    lang = await lang_of(call.from_user.id)
     p = await fetchone("SELECT * FROM products WHERE id=%s AND is_active=1", (pid,))
     if not p:
         await call.answer("Product not found", show_alert=True)
         return
+    stock = int(p["stock"])
+    if stock <= 0:
+        await call.answer(t(lang, "no_stock"), show_alert=True)
+        return
     cart = (await state.get_data()).get("cart", {})
     key = str(pid)
-    cart[key] = min(int(cart.get(key, 0)) + 1, int(p["stock"]))
+    cart[key] = min(max(int(cart.get(key, 0)), 1), stock)  # первый тап = 1 шт., дальше можно изменить
     await state.update_data(cart=cart)
+    await show_picker(call, state, p, lang)
+    await call.answer()
+
+
+async def apply_qty(call, state, pid, compute):
+    """Меняет количество товара в корзине (не больше остатка) и обновляет экран товара."""
+    lang = await lang_of(call.from_user.id)
+    p = await fetchone("SELECT * FROM products WHERE id=%s AND is_active=1", (pid,))
+    if not p:
+        await call.answer("Product not found", show_alert=True)
+        return
+    stock = int(p["stock"])
+    cart = (await state.get_data()).get("cart", {})
+    key = str(pid)
+    want = compute(int(cart.get(key, 0)))
+    qty = max(0, min(want, stock))
+    if qty:
+        cart[key] = qty
+    else:
+        cart.pop(key, None)
+    await state.update_data(cart=cart)
+    await show_picker(call, state, p, lang)
+    if want > stock:
+        await call.answer(f"Максимум на складе: {stock}" if lang == "ru" else f"מקסימום במלאי: {stock}")
+    else:
+        await call.answer()
+
+
+@dp.callback_query(F.data.startswith("sale:set:"))
+async def sale_set_qty(call: CallbackQuery, state: FSMContext):
+    _, _, pid, n = call.data.split(":")
+    await apply_qty(call, state, int(pid), lambda cur: int(n))
+
+
+@dp.callback_query(F.data.startswith("sale:adj:"))
+async def sale_adjust_qty(call: CallbackQuery, state: FSMContext):
+    _, _, pid, delta = call.data.split(":")
+    await apply_qty(call, state, int(pid), lambda cur: cur + int(delta))
+
+
+@dp.callback_query(F.data == "sale:cart")
+async def sale_cart(call: CallbackQuery, state: FSMContext):
     await show_cart(call, state)
     await call.answer()
 
@@ -645,10 +757,187 @@ async def stock_view(call: CallbackQuery):
         "SELECT name_ru,name_he,stock,sell_price_agorot FROM products WHERE is_active=1 ORDER BY category,name_ru")
     name_key = "name_ru" if lang == "ru" else "name_he"
     unit = "шт." if lang == "ru" else "יח׳"
-    text = "\n".join(f'{p[name_key]}: {p["stock"]} {unit} — {money(p["sell_price_agorot"])}'
-                     for p in rows) or t(lang, "no_products")
-    await call.message.edit_text(text, reply_markup=back_kb(lang))
+    if rows:
+        total_value = sum(int(p["stock"]) * int(p["sell_price_agorot"]) for p in rows)
+        header = ("💰 Товара на продажу на сумму: " if lang == "ru" else "💰 מוצרים למכירה בסכום של: ") + money(total_value)
+        lines = [f'{p[name_key]}: {p["stock"]} {unit} — {money(p["sell_price_agorot"])}' for p in rows]
+        text = header + "\n\n" + "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:3990] + "\n…"
+    else:
+        text = t(lang, "no_products")
+    await call.message.edit_text(text, reply_markup=kb([
+        [("📄 Скачать PDF" if lang == "ru" else "📄 הורד PDF", "stock:pdf")],
+        [(t(lang, "back"), "menu:main")]]))
     await call.answer()
+
+
+# ---------------------------------------------------------------- PDF остатков
+
+_PDF_FONTS = None
+
+
+def _register_pdf_fonts():
+    """Ищет шрифт с кириллицей и ивритом (Arial на Windows) и регистрирует его в reportlab."""
+    global _PDF_FONTS
+    if _PDF_FONTS:
+        return _PDF_FONTS
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    win = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+    candidates = [
+        (BASE_DIR / "font.ttf", BASE_DIR / "font-bold.ttf"),  # свой шрифт рядом со скриптом
+        (win / "arial.ttf", win / "arialbd.ttf"),
+        (Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")),
+        (Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
+         Path("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf")),
+        (Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+         Path("/System/Library/Fonts/Supplemental/Arial Bold.ttf")),
+    ]
+    for regular, bold in candidates:
+        if regular.exists():
+            pdfmetrics.registerFont(TTFont("BotFont", str(regular)))
+            pdfmetrics.registerFont(TTFont("BotFont-Bold", str(bold if bold.exists() else regular)))
+            _PDF_FONTS = ("BotFont", "BotFont-Bold")
+            return _PDF_FONTS
+    raise RuntimeError("Не найден шрифт с кириллицей и ивритом. Положите arial.ttf как font.ttf рядом со скриптом.")
+
+
+def _visual_rtl(text):
+    """Иврит пишется справа налево, а reportlab рисует слева направо: переупорядочиваем символы."""
+    try:
+        from bidi.algorithm import get_display
+        return get_display(text)
+    except ImportError:
+        # запасной вариант без python-bidi: меняем порядок символов, но числа и латиницу оставляем целыми
+        import re
+        tokens = re.findall(r"[0-9A-Za-z][0-9A-Za-z.,:%/\-]*|.", text, re.S)
+        return "".join(reversed(tokens))
+
+
+def build_stock_pdf(rows, lang, show_buy=False):
+    """PDF: наименование, количество, цена продажи (и цена закупки для администраторов). Возвращает bytes."""
+    import io
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT, TA_RIGHT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    font, font_bold = _register_pdf_fonts()
+    ru = lang == "ru"
+    fix = (lambda x: x) if ru else _visual_rtl
+    name_key = "name_ru" if ru else "name_he"
+    align = TA_LEFT if ru else TA_RIGHT
+    size = 10
+
+    title = "Остатки товара" if ru else "מלאי מוצרים"
+    headers = ["№", "Наименование", "Кол-во", "Цена продажи"] if ru else ["#", "שם מוצר", "כמות", "מחיר מכירה"]
+    if show_buy:
+        headers.append("Цена закупки" if ru else "מחיר קנייה")
+    total_label = "Итого" if ru else "סה״כ"
+
+    widths = [12 * mm, 66 * mm, 22 * mm, 40 * mm, 40 * mm] if show_buy else [12 * mm, 90 * mm, 28 * mm, 50 * mm]
+
+    def fit(text, width):
+        """Обрезает слишком длинное название, чтобы оно не вылезало за ячейку."""
+        limit = width - 8
+        if stringWidth(text, font, size) <= limit:
+            return text
+        while text and stringWidth(text + "…", font, size) > limit:
+            text = text[:-1]
+        return text + "…"
+
+    data = [[fix(h) for h in headers]]
+    total_qty = sell_value = buy_value = 0
+    for i, p in enumerate(rows, 1):
+        qty = int(p["stock"])
+        sell, buy = int(p["sell_price_agorot"]), int(p["buy_price_agorot"])
+        total_qty += qty
+        sell_value += qty * sell
+        buy_value += qty * buy
+        line = [str(i), fix(fit(str(p[name_key]), widths[1])), str(qty), money(sell)]
+        if show_buy:
+            line.append(money(buy))
+        data.append(line)
+    data.append(["", fix(total_label), str(total_qty)] + [""] * (len(headers) - 3))
+
+    name_col = 1
+    if not ru:  # для иврита колонки идут справа налево
+        data = [list(reversed(r)) for r in data]
+        widths = list(reversed(widths))
+        name_col = len(headers) - 2
+    last = len(data) - 1
+
+    table = Table(data, colWidths=widths, repeatRows=1)
+    table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), font),
+        ("FONTNAME", (0, 0), (-1, 0), font_bold),
+        ("FONTNAME", (0, last), (-1, last), font_bold),
+        ("FONTSIZE", (0, 0), (-1, -1), size),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2f4858")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("ROWBACKGROUNDS", (0, 1), (-1, last - 1), [colors.white, colors.HexColor("#eef2f5")]),
+        ("BACKGROUND", (0, last), (-1, last), colors.HexColor("#d9e2e8")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#b8c4cc")),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("ALIGN", (name_col, 0), (name_col, -1), "LEFT" if ru else "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+
+    title_style = ParagraphStyle("t", fontName=font_bold, fontSize=18, leading=22, alignment=align)
+    date_style = ParagraphStyle("d", fontName=font, fontSize=10, leading=14, alignment=align,
+                                textColor=colors.HexColor("#555555"))
+    sum_style = ParagraphStyle("s", fontName=font_bold, fontSize=11, leading=16, alignment=align)
+
+    summary = [fix(("Стоимость остатков по цене продажи: " if ru else "שווי המלאי במחיר מכירה: ") + money(sell_value))]
+    if show_buy:
+        summary.append(fix(("Стоимость остатков по цене закупки: " if ru else "שווי המלאי במחיר קנייה: ") + money(buy_value)))
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm,
+                            topMargin=15 * mm, bottomMargin=15 * mm, title=title)
+    doc.build([
+        Paragraph(fix(title), title_style),
+        Paragraph(datetime.now().strftime("%d.%m.%Y %H:%M"), date_style),
+        Spacer(1, 8 * mm),
+        table,
+        Spacer(1, 6 * mm),
+    ] + [Paragraph(line, sum_style) for line in summary])
+    return buf.getvalue()
+
+
+@dp.callback_query(F.data == "stock:pdf")
+async def stock_pdf(call: CallbackQuery):
+    u = await get_user(call.from_user.id)
+    lang = lang_for(u)
+    if not u or u["is_blocked"]:
+        await call.answer(t(lang, "blocked"), show_alert=True)
+        return
+    rows = await fetchall(
+        "SELECT name_ru,name_he,stock,sell_price_agorot,buy_price_agorot FROM products "
+        "WHERE is_active=1 ORDER BY category,name_ru")
+    if not rows:
+        await call.answer(t(lang, "no_products"), show_alert=True)
+        return
+    await call.answer("⏳")
+    try:
+        # цену закупки видят только администраторы
+        data = await asyncio.to_thread(build_stock_pdf, rows, lang, has_role(u, ADMINS))
+    except Exception:
+        logging.exception("PDF generation failed")
+        await call.message.answer(
+            "Не удалось создать PDF. Проверьте: pip install reportlab python-bidi" if lang == "ru"
+            else "יצירת ה-PDF נכשלה. בדוק: pip install reportlab python-bidi")
+        return
+    await call.message.answer_document(
+        BufferedInputFile(data, filename=f"stock_{datetime.now():%Y-%m-%d}.pdf"),
+        caption="📄 Остатки товара" if lang == "ru" else "📄 מלאי מוצרים")
 
 
 @dp.callback_query(F.data == "sales:mine")
@@ -710,6 +999,114 @@ async def products_menu(call: CallbackQuery):
         [(t(lang, "back"), "menu:main")]
     ]))
     await call.answer()
+
+
+# Изменение цены товара: выбрать товар → какую цену менять → ввести новое значение.
+# Старые продажи не меняются: в них цена сохранена на момент продажи.
+@dp.callback_query(F.data == "products:edit_price")
+async def price_list(call: CallbackQuery, state: FSMContext):
+    u = await guard(call, ADMINS)
+    if not u:
+        return
+    await state.clear()
+    lang = u["language"]
+    name_key = "name_ru" if lang == "ru" else "name_he"
+    products = await fetchall(
+        "SELECT id,name_ru,name_he,sell_price_agorot FROM products WHERE is_active=1 ORDER BY name_ru")
+    rows = [[(f'{p[name_key]} — {money(p["sell_price_agorot"])}'[:60], f"products:ep:{p['id']}")] for p in products]
+    rows.append([(t(lang, "back"), "products:menu")])
+    text = ("Выберите товар для изменения цены:" if lang == "ru" else "בחר מוצר לשינוי מחיר:") if products \
+        else t(lang, "no_products")
+    await call.message.edit_text(text, reply_markup=kb(rows))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("products:ep:"))
+async def price_choose_field(call: CallbackQuery):
+    u = await guard(call, ADMINS)
+    if not u:
+        return
+    lang = u["language"]
+    ru = lang == "ru"
+    pid = int(call.data.rsplit(":", 1)[1])
+    p = await fetchone("SELECT * FROM products WHERE id=%s AND is_active=1", (pid,))
+    if not p:
+        await call.answer("Товар не найден / מוצר לא נמצא", show_alert=True)
+        return
+    text = "\n".join([
+        p["name_ru" if ru else "name_he"],
+        f'{"Цена продажи" if ru else "מחיר מכירה"}: {money(p["sell_price_agorot"])}',
+        f'{"Цена закупки" if ru else "מחיר קנייה"}: {money(p["buy_price_agorot"])}',
+        "",
+        "Какую цену изменить?" if ru else "איזה מחיר לשנות?",
+    ])
+    await call.message.edit_text(text, reply_markup=kb([
+        [("💲 Цена продажи" if ru else "💲 מחיר מכירה", f"products:epf:{pid}:sell"),
+         ("📥 Цена закупки" if ru else "📥 מחיר קנייה", f"products:epf:{pid}:buy")],
+        [(t(lang, "back"), "products:edit_price")]
+    ]))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("products:epf:"))
+async def price_ask_value(call: CallbackQuery, state: FSMContext):
+    u = await guard(call, ADMINS)
+    if not u:
+        return
+    ru = u["language"] == "ru"
+    _, _, pid, which = call.data.split(":")
+    if which not in ("sell", "buy"):
+        await call.answer()
+        return
+    p = await fetchone("SELECT * FROM products WHERE id=%s AND is_active=1", (int(pid),))
+    if not p:
+        await call.answer("Товар не найден / מוצר לא נמצא", show_alert=True)
+        return
+    field = "sell_price_agorot" if which == "sell" else "buy_price_agorot"
+    await state.update_data(price_pid=int(pid), price_field=field)
+    await state.set_state(Form.edit_price)
+    label = ("цену продажи" if which == "sell" else "цену закупки") if ru \
+        else ("מחיר מכירה" if which == "sell" else "מחיר קנייה")
+    await call.message.answer(
+        (f'{p["name_ru"]}: сейчас {money(p[field])}\nВведите новую {label} в шекелях (например 8.50). Отмена: /cancel'
+         if ru else
+         f'{p["name_he"]}: כרגע {money(p[field])}\nהזן {label} חדש בשקלים (למשל 8.50). ביטול: /cancel'))
+    await call.answer()
+
+
+@dp.message(Form.edit_price)
+async def price_save(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    u = await get_user(uid)
+    if not has_role(u, ADMINS):
+        await state.clear()
+        await message.answer(t(lang_for(u), "not_allowed"))
+        return
+    ru = lang_for(u) == "ru"
+    value = await read_amount(message)
+    if value is None:
+        return
+    if value <= 0:
+        await say(message, uid, "bad_number")
+        return
+    data = await state.get_data()
+    pid, field = data.get("price_pid"), data.get("price_field")
+    if not pid or field not in ("sell_price_agorot", "buy_price_agorot"):
+        await state.clear()
+        await message.answer("Начните заново: Товары → Изменить цену" if ru else "התחל מחדש: מוצרים ← שינוי מחיר")
+        return
+    old = await fetchone(f"SELECT name_ru,name_he,{field} AS price FROM products WHERE id=%s", (pid,))
+    if not old:
+        await state.clear()
+        await message.answer("Товар не найден / מוצר לא נמצא")
+        return
+    await execute(f"UPDATE products SET {field}=%s WHERE id=%s", (value, pid))
+    await audit(uid, "price_changed", f"product={pid};{field};{old['price']}->{value}")
+    await state.clear()
+    await message.answer(
+        (f'✅ Цена изменена: {old["name_ru"]} — {money(old["price"])} → {money(value)}' if ru
+         else f'✅ המחיר עודכן: {old["name_he"]} — {money(old["price"])} ← {money(value)}'),
+        reply_markup=menu_kb(u))
 
 
 # Удаление товара: мягкое (is_active=0), чтобы старые продажи и отчёты остались целыми.
@@ -1141,8 +1538,8 @@ async def reports_menu(call: CallbackQuery):
     if not u:
         return
     await call.message.edit_text("Выберите отчёт / בחר דוח", reply_markup=kb([
-        [("📅 Сегодня / היום", "reports:today"), ("📆 Месяц / החודש", "reports:month")],
-        [("🏆 Рейтинг / דירוג", "reports:rank")],
+        [("📊 Финансовый отчёт за период / דוח כספי לתקופה", "reports:period")],
+        [("🏆 Рейтинг продавцов / דירוג מוכרים", "reports:rank")],
         [(t(u["language"], "back"), "menu:main")]
     ]))
     await call.answer()
@@ -1165,22 +1562,287 @@ async def report_period(call: CallbackQuery):
     await call.answer()
 
 
+async def seller_ranking(start):
+    sql = ("SELECT s.seller_telegram_id sid,u.full_name name,COUNT(*) n,SUM(s.total_agorot) revenue,"
+           "SUM(s.total_agorot-s.total_cost_agorot) profit FROM sales s "
+           "LEFT JOIN users u ON u.telegram_id=s.seller_telegram_id WHERE s.status='completed'")
+    args = []
+    if start is not None:
+        sql += " AND s.confirmed_at >= %s"
+        args.append(start)
+    sql += " GROUP BY s.seller_telegram_id,u.full_name ORDER BY n DESC,revenue DESC LIMIT 15"
+    return await fetchall(sql, tuple(args))
+
+
+def format_ranking(lang, rows):
+    ru = lang == "ru"
+    if not rows:
+        return t(lang, "no_sales")
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    return "\n".join(
+        f'{medals.get(i, str(i) + ".")} {r["name"] or "ID " + str(r["sid"])} — {r["n"]} '
+        f'{"продаж" if ru else "מכירות"}, {money(r["revenue"])}, {"прибыль" if ru else "רווח"} {money(r["profit"])}'
+        for i, r in enumerate(rows, 1))
+
+
 @dp.callback_query(F.data == "reports:rank")
 async def report_rank(call: CallbackQuery):
     u = await guard(call, ADMINS)
     if not u:
         return
     lang = u["language"]
-    rows = await fetchall(
-        "SELECT seller_telegram_id,COUNT(*) n,COALESCE(SUM(total_agorot),0) revenue,COALESCE(SUM(total_agorot-total_cost_agorot),0) profit FROM sales WHERE status='completed' GROUP BY seller_telegram_id ORDER BY n DESC")
-    if rows:
-        text = t(lang, "rank") + "\n".join(
-            f'{i}. ID {r["seller_telegram_id"]}: {r["n"]} продаж, {money(r["revenue"])}, profit {money(r["profit"])}'
-            for i, r in enumerate(rows, 1))
-    else:
-        text = t(lang, "no_sales")
-    await call.message.edit_text(text, reply_markup=back_kb(lang, "reports:menu"))
+    ru = lang == "ru"
+    month_start = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month_rows, all_rows = await asyncio.gather(seller_ranking(month_start), seller_ranking(None))
+    text = "\n".join([
+        "🏆 Рейтинг продавцов" if ru else "🏆 דירוג מוכרים",
+        "",
+        "📅 Этот месяц:" if ru else "📅 החודש:",
+        format_ranking(lang, month_rows),
+        "",
+        "🏅 За всё время:" if ru else "🏅 כל הזמן:",
+        format_ranking(lang, all_rows),
+    ])
+    await call.message.edit_text(text[:4000], reply_markup=back_kb(lang, "reports:menu"))
     await call.answer()
+
+
+# ---------------------------------------------------------------- финансы за период
+
+PERIODS = [("today", "Сегодня", "היום"), ("yesterday", "Вчера", "אתמול"),
+           ("week", "7 дней", "7 ימים"), ("month", "Этот месяц", "החודש"),
+           ("prevmonth", "Прошлый месяц", "חודש שעבר"), ("all", "За всё время", "כל הזמן")]
+
+
+def period_bounds(key):
+    """(начало, конец-не-включая) для готового периода; None означает «без границы»."""
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    day = timedelta(days=1)
+    first = today.replace(day=1)
+    next_first = (first + timedelta(days=32)).replace(day=1)
+    prev_first = (first - day).replace(day=1)
+    return {
+        "today": (today, today + day),
+        "yesterday": (today - day, today),
+        "week": (today - 6 * day, today + day),
+        "month": (first, next_first),
+        "prevmonth": (prev_first, first),
+        "all": (None, None),
+    }[key]
+
+
+def parse_period(text):
+    """Одна дата = один день, две даты = период (включительно). Форматы: 01.10.2026 или 2026-10-01."""
+    found = []
+    for m in re.finditer(r"(\d{1,2})[./](\d{1,2})[./](\d{4})|(\d{4})-(\d{2})-(\d{2})", text or ""):
+        try:
+            if m.group(1):
+                found.append(datetime(int(m.group(3)), int(m.group(2)), int(m.group(1))))
+            else:
+                found.append(datetime(int(m.group(4)), int(m.group(5)), int(m.group(6))))
+        except ValueError:
+            return None
+    if not found or len(found) > 2:
+        return None
+    return min(found), max(found) + timedelta(days=1)
+
+
+def period_label(start, end, lang):
+    if start is None and end is None:
+        return "за всё время" if lang == "ru" else "כל הזמן"
+    first = start.strftime("%d.%m.%Y")
+    last = (end - timedelta(days=1)).strftime("%d.%m.%Y")
+    return first if first == last else f"{first} – {last}"
+
+
+async def finance_summary(start, end):
+    sql = ("SELECT COUNT(*) n,COALESCE(SUM(total_agorot),0) revenue,"
+           "COALESCE(SUM(total_cost_agorot),0) cost FROM sales WHERE status='completed'")
+    args = []
+    if start is not None:
+        sql += " AND confirmed_at >= %s"
+        args.append(start)
+    if end is not None:
+        sql += " AND confirmed_at < %s"
+        args.append(end)
+    return await fetchone(sql, tuple(args))
+
+
+def format_finance(lang, start, end, row):
+    ru = lang == "ru"
+    revenue, cost = int(row["revenue"]), int(row["cost"])
+    profit = revenue - cost
+    margin = f" ({profit / revenue * 100:.1f}%)" if revenue > 0 else ""
+    return "\n".join([
+        ("📊 Период: " if ru else "📊 תקופה: ") + period_label(start, end, lang),
+        ("🧾 Продаж: " if ru else "🧾 מכירות: ") + str(row["n"]),
+        "",
+        ("💰 Выручка: " if ru else "💰 הכנסות: ") + money(revenue),
+        ("📦 Расходы (себестоимость проданного): " if ru else "📦 הוצאות (עלות המוצרים שנמכרו): ") + money(cost),
+        ("📈 Прибыль: " if ru else "📈 רווח: ") + money(profit) + margin,
+    ])
+
+
+def finance_kb(lang):
+    ru = lang == "ru"
+    rows, row = [], []
+    for key, name_ru, name_he in PERIODS:
+        row.append((name_ru if ru else name_he, f"reports:p:{key}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([("🗓 Свой период" if ru else "🗓 תקופה מותאמת", "reports:custom")])
+    rows.append([(t(lang, "back"), "reports:menu")])
+    return kb(rows)
+
+
+_TS_CACHE = {}
+
+
+async def ts_column(table):
+    """Имя колонки с датой в таблице (created_at и т.п.); None, если её нет."""
+    if table not in _TS_CACHE:
+        rows = await fetchall("SELECT COLUMN_NAME AS col FROM information_schema.columns "
+                              "WHERE table_schema=DATABASE() AND table_name=%s", (table,))
+        names = {r["col"].lower(): r["col"] for r in rows}
+        _TS_CACHE[table] = next((names[c] for c in ("created_at", "operation_date", "created", "timestamp",
+                                                    "date", "created_on", "operation_at") if c in names), None)
+    return _TS_CACHE[table]
+
+
+def _as_dt(v):
+    return v if isinstance(v, datetime) else datetime.combine(v, datetime.min.time())
+
+
+async def top_products(start, end, limit=5):
+    """Самые выгодные товары: чем быстрее продаётся товар и чем больше с него прибыль, тем выше.
+    Время продажи = от закупки (последняя закупка до первой продажи периода) до последней продажи,
+    не меньше 1 суток. Оценка = прибыль ÷ время продажи, то есть прибыль × скорость (1 / дни)."""
+    sql = ("SELECT i.product_id,MAX(i.product_name_ru) name_ru,MAX(i.product_name_he) name_he,"
+           "SUM(i.quantity*(i.unit_sell_agorot-i.unit_buy_agorot)) profit,"
+           "MIN(s.confirmed_at) first_sale,MAX(s.confirmed_at) last_sale "
+           "FROM sale_items i JOIN sales s ON s.id=i.sale_id WHERE s.status='completed'")
+    args = []
+    if start is not None:
+        sql += " AND s.confirmed_at >= %s"
+        args.append(start)
+    if end is not None:
+        sql += " AND s.confirmed_at < %s"
+        args.append(end)
+    items = [x for x in await fetchall(sql + " GROUP BY i.product_id", tuple(args))
+             if x["profit"] is not None and x["profit"] > 0]
+    if not items:
+        return [], True
+    col = await ts_column("stock_operations")
+    purchases = {}
+    if col:
+        ids = [x["product_id"] for x in items]
+        rows = await fetchall(
+            f"SELECT product_id,`{col}` AS d FROM stock_operations WHERE operation_type='purchase' "
+            f"AND product_id IN ({','.join(['%s'] * len(ids))})", tuple(ids))
+        for r in rows:
+            if r["d"]:
+                purchases.setdefault(r["product_id"], []).append(_as_dt(r["d"]))
+    result = []
+    for x in items:
+        first, last = _as_dt(x["first_sale"]), _as_dt(x["last_sale"])
+        before = [d for d in purchases.get(x["product_id"], []) if d <= first]
+        bought = max(before) if before else first
+        days = max(1.0, (last - bought).total_seconds() / 86400)
+        result.append({**x, "days": days, "score": int(x["profit"]) / days})
+    result.sort(key=lambda r: r["score"], reverse=True)
+    return result[:limit], bool(col)
+
+
+def format_top_products(lang, top, has_dates):
+    ru = lang == "ru"
+    head = ["", "🏆 Самые выгодные товары" if ru else "🏆 המוצרים הרווחיים ביותר",
+            "(чем быстрее продаётся и больше прибыль, тем выше)" if ru
+            else "(ככל שנמכר מהר יותר ורווחי יותר — מקום גבוה יותר)"]
+    if not top:
+        return "\n".join(head + ["—"])
+    lines = []
+    for i, r in enumerate(top, 1):
+        days = f'{r["days"]:.1f}'.rstrip("0").rstrip(".")
+        name = r["name_ru" if ru else "name_he"]
+        if ru:
+            lines.append(f'{i}. {name} — прибыль {money(r["profit"])} за {days} дн. = {money(round(r["score"]))}/день')
+        else:
+            lines.append(f'{i}. {name} — רווח {money(r["profit"])} ב-{days} {'יום' if days == '1' else 'ימים'} = {money(round(r["score"]))} ליום')
+    if not has_dates:
+        lines.append("ℹ️ В таблице закупок нет колонки с датой — время считается от первой продажи." if ru
+                     else "ℹ️ אין עמודת תאריך בטבלת הרכישות — הזמן נספר מהמכירה הראשונה.")
+    return "\n".join(head + lines)
+
+
+async def finance_report_text(lang, start, end):
+    row = await finance_summary(start, end)
+    top, has_dates = await top_products(start, end)
+    return format_finance(lang, start, end, row) + "\n" + format_top_products(lang, top, has_dates)
+
+
+@dp.callback_query(F.data == "reports:period")
+async def finance_period_menu(call: CallbackQuery, state: FSMContext):
+    u = await guard(call, ADMINS)
+    if not u:
+        return
+    await state.clear()
+    lang = u["language"]
+    await call.message.edit_text(
+        "Выручка, расходы и прибыль.\nВыберите период:" if lang == "ru"
+        else "הכנסות, הוצאות ורווח.\nבחר תקופה:", reply_markup=finance_kb(lang))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("reports:p:"))
+async def finance_period_result(call: CallbackQuery):
+    u = await guard(call, ADMINS)
+    if not u:
+        return
+    key = call.data.rsplit(":", 1)[1]
+    if key not in dict((k, 1) for k, _, _ in PERIODS):
+        await call.answer()
+        return
+    start, end = period_bounds(key)
+    text = await finance_report_text(u["language"], start, end)
+    await safe_edit(call, text, finance_kb(u["language"]))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "reports:custom")
+async def finance_custom_start(call: CallbackQuery, state: FSMContext):
+    u = await guard(call, ADMINS)
+    if not u:
+        return
+    await state.set_state(Form.report_range)
+    await call.message.answer(
+        "Введите период: две даты через дефис, например\n01.10.2026 - 27.10.2026\n"
+        "Одна дата покажет один день. Отмена: /cancel" if u["language"] == "ru"
+        else "הזן תקופה: שני תאריכים עם מקף, למשל\n01.10.2026 - 27.10.2026\n"
+             "תאריך אחד יציג יום אחד. ביטול: /cancel")
+    await call.answer()
+
+
+@dp.message(Form.report_range)
+async def finance_custom_result(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    u = await get_user(uid)
+    lang = lang_for(u)
+    if not has_role(u, ADMINS):
+        await state.clear()
+        await message.answer(t(lang, "not_allowed"))
+        return
+    bounds = parse_period(message.text)
+    if not bounds:
+        await message.answer("Не понял даты. Пример: 01.10.2026 - 27.10.2026" if lang == "ru"
+                             else "לא הבנתי את התאריכים. דוגמה: 01.10.2026 - 27.10.2026")
+        return
+    start, end = bounds
+    text = await finance_report_text(lang, start, end)
+    await state.clear()
+    await message.answer(text, reply_markup=finance_kb(lang))
 
 
 # ---------------------------------------------------------------- users (superadmin)
